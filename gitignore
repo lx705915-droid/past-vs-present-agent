@@ -1,0 +1,23 @@
+# Secrets
+.env
+
+# Local knowledge base & generated index
+knowledge/*
+!knowledge/.gitkeep
+kb_index.jsonl
+reports/*.run_log.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
