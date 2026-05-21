@@ -3,6 +3,9 @@
 """
 过去的我 vs 现在的我：个人知识库辩论 Agent
 
+默认接入小米 MiMo 开放平台（OpenAI 兼容接口），
+也可通过环境变量切换到任意 OpenAI 兼容服务。
+
 功能：
 1. 将本地 knowledge/ 目录中的 .md/.txt 文档切片、向量化、建立本地 JSONL 索引。
 2. 输入一个新选题或草稿，自动召回历史观点。
@@ -13,7 +16,7 @@
     pip install -r requirements.txt
 
 配置：
-    复制 .env.example 为 .env，并填入 OPENAI_API_KEY
+    复制 .env.example 为 .env，并填入 MiMo API Key
 
 命令行调用：
     python past_vs_present_agent.py index --docs ./knowledge --db ./kb_index.jsonl
@@ -54,7 +57,10 @@ except Exception:
     pass
 
 
-DEFAULT_CHAT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+# 默认接入小米 MiMo 开放平台（OpenAI 兼容接口）
+# Token Plan 用户使用 token-plan-cn.xiaomimimo.com，按量计费用户使用 api.xiaomimimo.com
+DEFAULT_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.xiaomimimo.com/v1")
+DEFAULT_CHAT_MODEL = os.getenv("OPENAI_MODEL", "mimo-v2.5-pro")
 DEFAULT_EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 DEFAULT_EMBED_DIMS = int(os.getenv("EMBED_DIMS", "1024"))
 SUPPORTED_EXTS = {".txt", ".md", ".markdown", ".mdx"}
@@ -82,6 +88,8 @@ class AgentRunConfig:
     max_chars_per_chunk: int = 1200
     chunk_overlap: int = 160
     batch_size: int = 64
+    base_url: Optional[str] = DEFAULT_BASE_URL
+    embed_base_url: Optional[str] = None  # embedding 可单独指向其他兼容服务
 
 
 class PastVsPresentAgent:
@@ -90,18 +98,30 @@ class PastVsPresentAgent:
         db_path: str = "./kb_index.jsonl",
         config: Optional[AgentRunConfig] = None,
         client: Optional[OpenAI] = None,
+        embed_client: Optional[OpenAI] = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.config = config or AgentRunConfig()
-        self.client = client or self._make_client()
+        self.client = client or self._make_client(self.config.base_url)
+        # 如果 embed_base_url 与 chat 不同，单独建一个客户端用于 embedding
+        if embed_client is not None:
+            self.embed_client = embed_client
+        elif self.config.embed_base_url and self.config.embed_base_url != self.config.base_url:
+            embed_key = os.getenv("EMBED_API_KEY") or os.getenv("OPENAI_API_KEY")
+            self.embed_client = OpenAI(api_key=embed_key, base_url=self.config.embed_base_url)
+        else:
+            self.embed_client = self.client
 
     @staticmethod
-    def _make_client() -> OpenAI:
+    def _make_client(base_url: Optional[str] = None) -> OpenAI:
         if not os.getenv("OPENAI_API_KEY"):
             raise AgentError(
                 "缺少 OPENAI_API_KEY。请在环境变量中设置，或复制 .env.example 为 .env 后填写。"
             )
-        return OpenAI()
+        kwargs: Dict[str, Any] = {}
+        if base_url:
+            kwargs["base_url"] = base_url
+        return OpenAI(**kwargs)
 
     # -------------------------
     # Indexing
@@ -304,7 +324,7 @@ class PastVsPresentAgent:
             kwargs["dimensions"] = self.config.embed_dims
 
         try:
-            resp = self.client.embeddings.create(**kwargs)
+            resp = self.embed_client.embeddings.create(**kwargs)
         except Exception as exc:
             raise AgentError(f"Embedding 调用失败：{exc}") from exc
 
@@ -489,12 +509,19 @@ class PastVsPresentAgent:
         input_text: str,
         max_output_tokens: int,
     ) -> Tuple[str, Dict[str, Any]]:
+        """
+        使用 Chat Completions 接口调用 Agent。
+        MiMo 开放平台 OpenAI 兼容，因此使用 chat.completions.create
+        以获得最佳跨服务兼容性。
+        """
         try:
-            resp = self.client.responses.create(
+            resp = self.client.chat.completions.create(
                 model=self.config.chat_model,
-                instructions=instructions,
-                input=input_text,
-                max_output_tokens=max_output_tokens,
+                messages=[
+                    {"role": "system", "content": instructions},
+                    {"role": "user", "content": input_text},
+                ],
+                max_tokens=max_output_tokens,
             )
         except Exception as exc:
             raise AgentError(f"{name} 调用失败：{exc}") from exc
@@ -508,21 +535,14 @@ class PastVsPresentAgent:
 
     @staticmethod
     def _extract_response_text(resp: Any) -> str:
-        text = getattr(resp, "output_text", None)
-        if text:
-            return text.strip()
-
         try:
-            parts: List[str] = []
-            for item in resp.output:
-                if getattr(item, "type", None) == "message":
-                    for content in item.content:
-                        content_type = getattr(content, "type", None)
-                        if content_type in {"output_text", "text"}:
-                            parts.append(getattr(content, "text", ""))
-            return "\n".join(parts).strip()
+            choice = resp.choices[0]
+            content = choice.message.content
+            if content:
+                return content.strip()
         except Exception:
-            return str(resp)
+            pass
+        return str(resp)
 
     @staticmethod
     def _usage_to_dict(resp: Any) -> Dict[str, Any]:
@@ -540,14 +560,14 @@ class PastVsPresentAgent:
 
 
 PAST_SELF_INSTRUCTIONS = """
-你是“过去的我” Agent。
+你是"过去的我" Agent。
 你只能基于召回到的历史材料发言，不能编造经历、项目、数据或观点。
 
 你的任务：
 1. 总结过去的我在这个议题上的核心立场。
 2. 模拟过去的我的思考方式，提出对当前议题/草稿的回应。
 3. 明确引用证据编号，例如 [S1]、[S3]。
-4. 如果历史材料不足，要直接说“不足以判断”。
+4. 如果历史材料不足，要直接说"不足以判断"。
 
 输出结构：
 - 过去立场摘要
@@ -557,8 +577,8 @@ PAST_SELF_INSTRUCTIONS = """
 
 
 PRESENT_SELF_INSTRUCTIONS = """
-你是“现在的我” Agent。
-你需要基于当前议题和当前草稿，提炼“现在的我”的立场。
+你是"现在的我" Agent。
+你需要基于当前议题和当前草稿，提炼"现在的我"的立场。
 不要讨好过去的我，不要为了显得进步而强行制造变化。
 
 你的任务：
@@ -575,7 +595,7 @@ PRESENT_SELF_INSTRUCTIONS = """
 
 JUDGE_INSTRUCTIONS = """
 你是中立裁判 Agent。
-你需要比较“过去的我”和“现在的我”的观点关系。
+你需要比较"过去的我"和"现在的我"的观点关系。
 
 重点判断：
 1. 这是观点进化、观点倒退、表述重复，还是只是换了说法？
@@ -613,6 +633,8 @@ def make_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chat-model", default=DEFAULT_CHAT_MODEL, help="用于多 Agent 推理的模型")
     parser.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL, help="用于向量化的模型")
     parser.add_argument("--embed-dims", type=int, default=DEFAULT_EMBED_DIMS, help="embedding 维度")
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Chat 接口 base_url（默认 MiMo）")
+    parser.add_argument("--embed-base-url", default=None, help="Embedding 接口 base_url（不填则与 chat 一致）")
 
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -650,6 +672,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         batch_size=getattr(args, "batch_size", 64),
         max_chars_per_chunk=getattr(args, "max_chars", 1200),
         chunk_overlap=getattr(args, "overlap", 160),
+        base_url=args.base_url,
+        embed_base_url=args.embed_base_url,
     )
 
     try:
